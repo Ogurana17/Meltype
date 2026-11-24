@@ -6,8 +6,11 @@ using System.Text.Json;
 using Meltype.Composition;
 using Meltype.Config;
 using Meltype.Detection;
+using Meltype.Dictionary;
+using Meltype.Engine;
 using Meltype.Ime;
 using Meltype.Input;
+using Meltype.Learning;
 
 namespace Meltype.Tests;
 
@@ -23,10 +26,23 @@ internal static class ImeContractTests
     /// </summary>
     private sealed class Front : IImeEnvironment
     {
-        private readonly ImeHost _host;
+        private ImeHost? _host;
         private readonly List<string> _trace = [];
 
-        public Front() => _host = new ImeHost(this, () => Settings);
+        // Converter・Services・ClassifyDirect を初期化子で決めてから作る
+        private ImeHost Host => _host ??= Create();
+
+        private ImeHost Create()
+        {
+            MeltypeRuntime.Connect(CompositionTests.Detector, Services);
+            return new ImeHost(this, new SessionParts(CompositionTests.Detector, Converter, Services) { ClassifyDirect = ClassifyDirect, LateResults = () => LateResults }, () => Settings);
+        }
+
+        /// <summary>変換エンジンの答えを待たず、後から受け取るか (<see cref="SessionParts.LateResults"/>)。入力欄を作った後に変えてもよい。</summary>
+        public bool LateResults { get; set; }
+
+        /// <summary>英数状態で打ち始めた英字がローマ字 (日本語) かの判定。null なら判定しない。</summary>
+        public Func<string, bool, Settings, Verdict>? ClassifyDirect { get; init; }
 
         // 入力モードの表示の既定は OS と入力方式で違うので、どの OS でも同じに決めておく
         public Settings Settings { get; set; } = new() { LiveConversion = false, ModeIndicator = ModeIndicatorTiming.OnSwitchAndFocus };
@@ -37,21 +53,23 @@ internal static class ImeContractTests
         public IKanjiConverter Converter { get; init; } = new CompositionTests.FakeConverter();
         public CompositionServices Services { get; init; } = new();
 
-        public MeltypeSession CreateSession(Func<Settings> settings) =>
-            new(CompositionTests.Detector, Converter, Services, settings, directModeDetection: true);
-
         public SnippetStore Snippets { get; } = new(null);
 
         public string? ClipboardText => null;
 
-        public int Sessions => _host.SessionCount;
+        public string? OtherTipVersion => null;
 
-        public void CloseAll() => _host.CloseAll();
+        public int Sessions => Host.SessionCount;
+
+        public void CloseAll() => Host.CloseAll();
 
         public string Document { get; set; } = "";
 
         /// <summary>OS の IME の開閉 (TSF の OPENCLOSE)。</summary>
         public bool Open { get; set; } = true;
+
+        /// <summary>OS が IME の開閉を持つフロント (TSF など) か。持たないフロント (Android) は imeOpen を送らない。</summary>
+        public bool SendsImeOpen { get; init; } = true;
 
         /// <summary>入力欄の性質 (OS が知らせるもの)。</summary>
         public List<string> Traits { get; } = [];
@@ -83,7 +101,7 @@ internal static class ImeContractTests
 
         public JsonElement Send(string json)
         {
-            var reply = _host.Handle(json);
+            var reply = Host.Handle(json);
             _trace.Add($"  {json}\n    → {reply}");
             using var document = JsonDocument.Parse(reply);
             return document.RootElement.Clone();
@@ -99,7 +117,7 @@ internal static class ImeContractTests
             var field = $"{{{surrounding}\"composing\":{(composing ? "true" : "false")},\"traits\":{JsonSerializer.Serialize(Traits)}" +
                 (App is null ? "" : $",\"app\":{Json(App)}") + (Selection is null ? "" : $",\"selection\":{Json(Selection)}") + "}";
             var fieldFact = omitField ? "" : $",\"field\":{field}";
-            var output = Send($"{{\"version\":{ImeHost.Version},\"type\":\"{type}\",\"instance\":{Json(instance)},\"imeOpen\":{(Open ? "true" : "false")}{fieldFact}{extra}}}");
+            var output = Send($"{{\"version\":{ImeHost.Version},\"type\":\"{type}\",\"instance\":{Json(instance)}{(SendsImeOpen ? $",\"imeOpen\":{(Open ? "true" : "false")}" : "")}{fieldFact}{extra}}}");
             Apply(output, instance);
             return output;
         }
@@ -205,6 +223,18 @@ internal static class ImeContractTests
         front.Key('\n');
         Assert.Equal("今日はあいうえお", front.Document, front.Trace);
         Assert.True(!Consumed(front.Key('\n')), "打っていないときの Enter はアプリに通す\n" + front.Trace);
+    }
+
+    [Test]
+    public static void Settings_AreReadOncePerEvent()
+    {
+        // 出来事の途中で設定が変わっても (受け持つ → 止める)、その出来事の中の判断は始めに読んだ設定でそろえる
+        var reads = 0;
+        var session = new TestSession(() => new Settings { Enabled = ++reads <= 2 });
+        session.HandleKey('A', 'a', false, false, false, false);
+        var k = session.HandleKey('K', 'k', false, false, false, false);
+        Assert.Equal(2, reads, "設定は出来事ごとに 1 回読む");
+        Assert.True(session.State.HandlesInput && k.Consumed, "受け持つと答えたキーはアプリに通さない");
     }
 
     [Test]
@@ -479,11 +509,26 @@ internal static class ImeContractTests
             "入力中のキーの役割を分けるなら、無変換は英字にする\n" + front.Trace);
         front.Key('\n');
         front.Settings.SeparateKeyRoles = false;
+        // 役割を分けなくても、無変換でカタカナを切り替える設定が ON なら、入力中の無変換は確定せず切り替える
+        front.Settings.NonConvertCyclesKana = true;
+        front.Type("ka");
+        var cycle = front.Key(VirtualKeys.NonConvert);
+        Assert.True(front.Open && cycle.GetProperty("result").GetProperty("view").GetProperty("text").GetString() == "カ",
+            "無変換でカタカナ (確定して英数にしない)\n" + front.Trace);
+        front.Key('\n');
+        front.Settings.NonConvertCyclesKana = false;
         // 親指シフトの配列では親指キー (変換ボックスで使う)
         front.Settings.InputStyle = InputStyle.Kana;
         front.Settings.KanaLayout = KanaLayout.Nicola;
         front.Key(VirtualKeys.NonConvert);
         Assert.True(front.Open, "NICOLA の無変換は切り替えない\n" + front.Trace);
+        // 変換・無変換が 1 つのキーのキーボードでは、そのキーを切り替えキーに登録して日本語 / 英数を行き来する
+        var toggle = new Front();
+        toggle.Settings.ToggleShortcuts = [new() { Key = VirtualKeys.Convert }];
+        toggle.Key(VirtualKeys.Convert);
+        Assert.True(!toggle.Open, "切り替えキーの変換で英数\n" + toggle.Trace);
+        toggle.Key(VirtualKeys.Convert);
+        Assert.True(toggle.Open, "もう一度押して日本語\n" + toggle.Trace);
     }
 
     [Test]
@@ -586,6 +631,22 @@ internal static class ImeContractTests
     }
 
     [Test]
+    public static void EmailAndNumericFields_AreNotHandled()
+    {
+        foreach (var trait in new[] { "Email", "Numeric" })
+        {
+            var front = new Front { SendsImeOpen = false };
+            front.Traits.Add(trait);
+            var entered = front.Event("CaretMoved", extra: Entered);
+            Assert.True(!Active(entered) && entered.GetProperty("state").GetProperty("languageMode").GetString() == "Alphanumeric", $"{trait}: 受け持たない (英数)\n" + front.Trace);
+            Assert.True(!Active(front.Key('a')) && front.Document == "a", $"{trait}: キーはそのまま入る\n" + front.Trace);
+            Assert.True(front.Event("JapaneseModeSelected").GetProperty("state").GetProperty("languageMode").GetString() == "Alphanumeric", $"{trait}: 日本語にしない\n" + front.Trace);
+            front.Traits.Clear();
+            Assert.True(front.Event("CaretMoved", extra: Entered).GetProperty("state").GetProperty("languageMode").GetString() == "Japanese", $"{trait}: ふつうの欄では日本語\n" + front.Trace);
+        }
+    }
+
+    [Test]
     public static void Password_PassesKeysWithoutCreatingASession()
     {
         foreach (var traits in new string[][] { ["Password"], ["Password", "Private"], ["Terminal", "Password"] })
@@ -607,6 +668,54 @@ internal static class ImeContractTests
             front.Type("sa");
             Assert.Equal("さ", front.Composition["t1"], "周辺文字列が届かない通常欄では変換する\n" + front.Trace);
         }
+    }
+
+    [Test]
+    public static void Password_OverridesAppRuleThatTreatsFieldAsText()
+    {
+        const string app = "auth-client";
+        var front = new Front { App = app };
+        front.Settings.AppRules.Add(new AppRule { Process = app, TextInput = true });
+        front.Traits.Add("NonText");
+        Assert.True(front.Type("ka").All(Consumed), "アプリ別設定でテキスト欄として受け持つ\n" + front.Trace);
+        Assert.Equal("か", front.Composition["t1"], front.Trace);
+
+        front.Traits.Add("Password");
+        foreach (var key in "aiueo\n")
+        {
+            AssertPasswordPass(front, front.Key(key));
+        }
+        Assert.Equal("aiueo\n", front.Document, "パスワード欄では未確定文字を取り消して打鍵を通す\n" + front.Trace);
+    }
+
+    [Test]
+    public static void Password_TerminalPromptPassesKeys()
+    {
+        // 履歴の /* で、後ろの行が複数行コメントの中と判定される (#1201)
+        const string history = "$ ls /etc/*\nfoo bar\n$ sudo ls\n";
+        foreach (var prompt in new[]
+                 {
+                     "[sudo] password for user: ", "[sudo] user のパスワード:", "[sudo] Passwort für user: ", "[sudo] user 的密码：",
+                     "[sudo: authenticate] Password: ", "[sudo: authenticate] パスワード: ", "Password: ", "user@host's password: ",
+                     "Enter passphrase for key '/home/user/.ssh/id_ed25519': ", "Password for 'https://user@github.com': ",
+                 })
+        {
+            // Meltype キーボードはターミナルと知らせず、アプリ名だけ送る
+            foreach (var front in new[] { new Front { Terminal = true, Sends = history + prompt }, new Front { App = "WindowsTerminal.exe", Sends = history + prompt } })
+            {
+                foreach (var key in "nihongo\n")
+                {
+                    AssertPasswordPass(front, front.Key(key));
+                }
+            }
+        }
+
+        var comment = new Front { Terminal = true, Sends = history + "[sudo] password for user: \n$ echo # " };
+        comment.Type("sa");
+        Assert.Equal("さ", comment.Composition["t1"], "プロンプトの次の行では、今までどおり判定する\n" + comment.Trace);
+        var text = new Front { Sends = "Password: " };
+        text.Type("sa");
+        Assert.Equal("さ", text.Composition["t1"], "ターミナルでない入力欄では変換する\n" + text.Trace);
     }
 
     [Test]
@@ -671,7 +780,7 @@ internal static class ImeContractTests
         var front = new Front
         {
             Open = false,
-            Services = new CompositionServices { ClassifyDirect = (letters, _) => letters == "ka" ? Verdict.Japanese : Verdict.Undecided },
+            ClassifyDirect = (letters, _, _) => letters == "ka" ? Verdict.Japanese : Verdict.Undecided,
         };
         front.Settings.DirectModeAutoDetect = true;
         front.Key('k');
@@ -697,10 +806,9 @@ internal static class ImeContractTests
                 if (reading != "にほんご" || !release.Wait(5000)) return null;
                 return [new ConversionClause(reading, "日本語")];
             }, _ => []);
-            converter.Budget.Enable();
             converter.ResultReady += ready.Set;
             var phrases = new PhraseHistory(null);
-            var front = new Front { Converter = converter, Services = new CompositionServices { Predictor = new Predictor(phrases, null, null) } };
+            var front = new Front { Converter = converter, LateResults = true, Services = new CompositionServices { Predictor = new Predictor(phrases, null, null) } };
             front.Settings.LiveConversion = true;
             front.Settings.PredictiveCandidates = true;
             Assert.Equal("にほんご", View(front.Type("nihongo")[^1]).GetProperty("text").GetString(), front.Trace);
@@ -718,13 +826,33 @@ internal static class ImeContractTests
         }
     }
 
-    private sealed class LearningConverter : IKanjiConverter, ILearningConverter
+    [Test]
+    public static void LateResults_TakesEffectAfterTheHostIsCreated()
+    {
+        // fcitx5 は入力欄を作ってから、答えを後から受け取ると知らせる (meltype_set_conversion_ready)。その後のキーは答えを待たない
+        using var release = new ManualResetEventSlim();
+        using var converter = new BackgroundCallbackConverter((reading, _) =>
+        {
+            if (reading != "にほんご" || !release.Wait(5000)) return null;
+            return [new ConversionClause(reading, "日本語")];
+        }, _ => []);
+        var front = new Front { Converter = converter };
+        front.Settings.LiveConversion = true;
+        front.Event("StateRequested");
+        front.LateResults = true;
+        var started = Environment.TickCount64;
+        Assert.Equal("にほんご", View(front.Type("nihongo")[^1]).GetProperty("text").GetString(), front.Trace);
+        Assert.True(Environment.TickCount64 - started < 2000, "変換エンジンの答えを待たない");
+        release.Set();
+    }
+
+    private sealed class LearningConverter : TestConverter
     {
         private readonly CompositionTests.FakeConverter _converter = new();
         public ConcurrentQueue<(string? Context, IReadOnlyList<ConversionClause> Clauses)> Learned { get; } = new();
-        public string? Convert(string hiragana) => _converter.Convert(hiragana);
-        public IReadOnlyList<ConversionClause>? ConvertClauses(string hiragana, string? context = null) => _converter.ConvertClauses(hiragana, context);
-        public void Learn(string? context, IReadOnlyList<ConversionClause> clauses) => Learned.Enqueue((context, clauses));
+        public override string? Convert(string hiragana, string? before) => _converter.Convert(hiragana, before);
+        public override IReadOnlyList<ConversionClause>? ConvertClauses(string hiragana, string? before) => _converter.ConvertClauses(hiragana, before);
+        public override void Learn(string? context, IReadOnlyList<ConversionClause> clauses) => Learned.Enqueue((context, clauses));
     }
 
     [Test]
@@ -769,7 +897,7 @@ internal static class ImeContractTests
             {
                 Languages = languages, History = history, Predictor = new Predictor(phrases, null, history),
                 Translations = TranslationDictionary.Parse("川\tn\triver"), TranslationHistory = translationHistory,
-                MoreCandidates = reading => reading == "にほんご" ? ["日本語", "日本語文"] : [],
+                MoreCandidates = (reading, _) => reading == "にほんご" ? ["日本語", "日本語文"] : [],
             }
         };
         front.Settings.PredictiveCandidates = true;
@@ -999,6 +1127,24 @@ internal static class ImeContractTests
         var toggle = new Front();
         toggle.Settings.ToggleShortcuts = [new() { Key = 0x14 }];
         Assert.True(Consumed(toggle.Key(0x14)) && !toggle.Open, "切り替えキーの CapsLock で英数\n" + toggle.Trace);
+    }
+
+    [Test]
+    public static void KanaKey_IsTheSameKeyOnEveryFront()
+    {
+        // カタカナ/ひらがな キーは Windows が 0xF2、IBus・fcitx5・Mac が 0x15 で送る
+        foreach (var vk in new[] { VirtualKeys.OemCopy, VirtualKeys.Kana })
+        {
+            var front = new Front();
+            front.Key(VirtualKeys.NonConvert);
+            Assert.True(Consumed(front.Key(vk)) && front.Open, $"0x{vk:X2}: 日本語にする\n" + front.Trace);
+            var toggle = new Front();
+            toggle.Settings.ToggleShortcuts = [new() { Key = VirtualKeys.Kana }];
+            toggle.Key(vk);
+            Assert.True(!toggle.Open, $"0x{vk:X2}: 切り替えキーに登録したら英数\n" + toggle.Trace);
+            toggle.Key(vk);
+            Assert.True(toggle.Open, $"0x{vk:X2}: もう一度押して日本語\n" + toggle.Trace);
+        }
     }
 
     [Test]

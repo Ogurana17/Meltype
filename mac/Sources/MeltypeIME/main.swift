@@ -29,9 +29,6 @@ if CommandLine.arguments.contains("--register-input-source") {
     exit(0)
 }
 
-/// 変換の候補の一覧 (すべての入力欄で共有する)。
-var candidatesWindow: IMKCandidates?
-
 func runIsolatedChecks(inputPath: String?) -> Int32 {
     let files = FileManager.default
     let data = files.temporaryDirectory.appendingPathComponent("meltype-input-check.\(UUID().uuidString)", isDirectory: true)
@@ -126,7 +123,7 @@ func runChecks(inputPath: String?) -> Int32 {
     for (input, expected) in [("kyouhagoogledekensaku \n", "今日はgoogleで検索"),
                                ("I want to go to the park\n", "I want to go to the park"),
                                ("google github hello\n", "google github hello"),
-                               ("seeyouagain\n", "see you again")] {
+                               ("seeyouagain\n", "seeyouagain")] {
         let document = Document()
         _ = type(input, into: document)
         print("result: \(document.text)")
@@ -135,17 +132,6 @@ func runChecks(inputPath: String?) -> Int32 {
     let english = Document()
     _ = type("reflectsareta\n", into: english)
     check("issue 77: reflect + Japanese", english.text == "reflectされた")
-    let sentence = "kyouhagoogledekensakusitekekkawomiru\n"
-    let started = Date()
-    let checksBefore = NativeCore.shared.spellCheckCount
-    let first = Document()
-    _ = type(sentence, into: first)
-    let checksAfterFirst = NativeCore.shared.spellCheckCount
-    let second = Document()
-    _ = type(sentence, into: second)
-    let repeatedChecks = NativeCore.shared.spellCheckCount - checksAfterFirst
-    print("issue 114: first checks=\(checksAfterFirst - checksBefore), repeat checks=\(repeatedChecks), elapsed=\(Date().timeIntervalSince(started))s")
-    check("issue 114: repeated spelling uses cache", repeatedChecks == 0 && first.text == second.text)
     let other: [String: Any] = ["InputSourceKind": "Keyboard Layout", "KeyboardLayout Name": "ABC"]
     let duplicate: [String: Any] = ["Bundle ID": InputSourceRegistration.identifier, "InputSourceKind": "Keyboard Input Method", "metadata": ["keep": true]]
     let duplicateMode: [String: Any] = ["Bundle ID": InputSourceRegistration.identifier,
@@ -247,7 +233,6 @@ guard let bundleIdentifier = Bundle.main.bundleIdentifier,
     NSLog("Meltype: IMKServer を起動できませんでした (Meltype.app から起動してください)")
     exit(1)
 }
-candidatesWindow = IMKCandidates(server: server, panelType: kIMKSingleColumnScrollingCandidatePanel)
 NSRegisterServicesProvider(ModeServices.shared, ModeServices.portName)
 NativeCore.shared.startBackgroundConversion()
 // 終了するときに llama-server を止める (ログアウトなどの終了と、SIGTERM。強制終了で残ったものは、次に起動したときに止める)

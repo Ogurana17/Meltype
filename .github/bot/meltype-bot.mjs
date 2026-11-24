@@ -19,6 +19,9 @@ const Marker = '<!-- meltype-bot -->';
 const Maintainers = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 const MaxKeys = 300;
 const MaxRepros = 10;
+// /learn の手順の数と、確定した語の長さの上限 (Repro.cs の MaxLessons と同じ数)
+const MaxLessons = 5;
+const MaxLessonText = 50;
 
 async function gh(method, url, body, auth = token) {
   const response = await fetch(`${api}/repos/${repo}${url}`, {
@@ -82,21 +85,22 @@ async function react(content) {
 }
 
 const Help = [
-  'Meltype bot のコマンド (コメントの行の先頭に書いてください。`/release`・`/pre-release` は 1 行目だけ。1 つのコメントに 1 つ。`/repro` だけは 1 行に 1 つずつ複数書けます):',
+  'Meltype bot のコマンド (コメントの行の先頭に書いてください。`/release`・`/pre-release` は 1 行目だけ。1 つのコメントに 1 つ。`/repro` だけは 1 行に 1 つずつ複数書けます。`/learn` は `/repro`・`/ca` と同じコメントに書きます):',
   '',
   '| コマンド | すること | 使える人 |',
   '|---|---|---|',
-  '| `/repro <打ったキー> [space\\|enter\\|none]` | 最新のコードで打つ (Mozc があれば漢字も) | だれでも |',
+  '| `/repro <打ったキー> [space\\|enter\\|none]` | main と最新リリースのコードで、Mozc だけと Mozc + Zenzai で打つ | だれでも |',
+  '| `/repro <SHA> <打ったキー> [space\\|enter\\|none]` | `/repro` を PR の前・PR・main のコードで行い、PR で結果が変わったか比べる | メンテナー (PR のみ) |',
   '| `/explain <打ったキー>` | 英数状態の検知での 1 文字ずつの判定理由 | だれでも |',
   '| `/ca <打ったキー>` | Space で変換して、文節の区切りと最初の文節の候補 (9 件まで) を出す | だれでも |',
+  `| \`/learn <打ったキー> [→ <確定した語>]\` | 同じコメントの \`/repro\`・\`/ca\` の前に、別の入力欄で打って確定し、学習させる (確定した語があれば Space で変換して候補から選ぶ)。${MaxLessons} 行まで | だれでも |`,
   '| `/jht <出てほしい文> [/ 読み]` | 考えられるローマ字打ちで変換テスト (読みはオプション) | だれでも |',
   '| `/test <SHA>` | Pull Request のコードでテストを流す | メンテナー |',
-  '| `/pack <SHA>` | Pull Request のコードでテスト版の zip を作る | メンテナー |',
-  '| `/test-repro <SHA> <キー>` | PR のコードで `/repro` | メンテナー |',
+  '| `/pack <SHA>` | Pull Request のコードでテスト版のインストーラー (setup.exe) を作る | メンテナー |',
   '| `/test-jht <SHA> <文> [/ 読み]` | PR のコードで `/jht` | メンテナー |',
   '| `/test-explain <SHA> <キー>` | PR のコードで `/explain` | メンテナー |',
-  '| `/release <版>` | 版 (例: `1.2.3`) のタグとリリースの下書きを作り、Windows・Mac・Linux の配布物のビルドを始める。csproj・Info.plist の版が <版> でないか、docs/release-notes/<版>.md が無ければ止める | 管理者 |',
-  '| `/pre-release <版>` | `/release` のプレリリース版 (版は `1.2.3-pre.1` の形) | 管理者 |',
+  '| `/release <版>` | 版 (例: `1.2.3`) のタグとリリースの下書きを作り、Windows・Mac・Linux の配布物のビルドを始める。src/Directory.Build.props・Info.plist の版が <版> でないか、docs/release-notes/<版>.md が無ければ止める | 管理者 |',
+  '| `/pre-release <版>` | `/release` のプレリリース版 (版は `1.2.3-pre.1`・`1.2.3-rc.1` の形) | 管理者 |',
   '| `/self-assign` | 自分を Issue の Assignees に入れる (担当になる)。`要トリアージ` の間はメンテナーだけ | だれでも |',
   '| `/help` | この一覧 | だれでも |',
   '',
@@ -104,8 +108,8 @@ const Help = [
 ].join('\n');
 
 // /release <版>・/pre-release <版> (issue #665)。管理者 (admin / maintain) だけ。
-//   1. 版の形を確かめる (release: 1.2.3 / pre-release: 1.2.3-pre.1)
-//   2. main の csproj (2 つ)・Info.plist の版が <版> と合うか確かめる (版を上げ忘れた配布を防ぐ: issue #601)
+//   1. 版の形を確かめる (release: 1.2.3 / pre-release: 1.2.3-pre.1・1.2.3-rc.1)
+//   2. main の src/Directory.Build.props・Info.plist の版が <版> と合うか確かめる (版を上げ忘れた配布を防ぐ: issue #601)
 //   3. タグ v<版> を main の先頭に作る (もうあれば止める)
 //   4. リリースの下書きを作る。本文は main の docs/release-notes/<版>.md (配布物にも同じものを同梱する: issue #1207)。無ければ止める。pre-release は prerelease
 //   5. 配布物のビルド (release.yml) を、そのタグで始める。ビルドが終わると、下書きに配布物を付けて公開する
@@ -116,15 +120,13 @@ async function releaseCommand(issue, command, version) {
   const pre = command === 'pre-release';
   const permission = await gh('GET', `/collaborators/${event.comment.user.login}/permission`).then(r => r.permission).catch(() => 'none');
   if (!['admin', 'maintain'].includes(permission)) return reply(`\`/${command}\` は管理者 (admin / maintain) だけが使えます。`);
-  const shape = pre ? /^\d+\.\d+\.\d+-pre\.\d+$/ : /^\d+\.\d+\.\d+$/;
-  if (!shape.test(version)) return reply(`版を ${pre ? '`1.2.3-pre.1`' : '`1.2.3`'} の形で書いてください (例: \`/${command} ${pre ? '1.2.3-pre.1' : '1.2.3'}\`)。`);
+  const shape = pre ? /^\d+\.\d+\.\d+-(pre|rc)\.\d+$/ : /^\d+\.\d+\.\d+$/;
+  if (!shape.test(version)) return reply(`版を ${pre ? '`1.2.3-pre.1`・`1.2.3-rc.1`' : '`1.2.3`'} の形で書いてください (例: \`/${command} ${pre ? '1.2.3-pre.1' : '1.2.3'}\`)。`);
   await react('eyes');
   const read = async file => Buffer.from((await gh('GET', `/contents/${file}?ref=main`)).content, 'base64').toString('utf8');
   const mismatches = [];
-  for (const file of ['src/Meltype.Windows/Meltype.Windows.csproj', 'src/Meltype.Core/Meltype.Core.csproj']) {
-    const found = (await read(file)).match(/<Version>([^<]+)<\/Version>/)?.[1];
-    if (found !== version) mismatches.push(`${file}: ${found ?? '(版なし)'}`);
-  }
+  const props = (await read('src/Directory.Build.props')).match(/<Version>([^<]+)<\/Version>/)?.[1];
+  if (props !== version) mismatches.push(`src/Directory.Build.props: ${props ?? '(版なし)'}`);
   const plain = version.replace(/-.*$/, '');
   const plist = await read('mac/Resources/Info.plist');
   const plistVersion = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/)?.[1];
@@ -195,9 +197,27 @@ async function parse() {
   }
   // コマンドはどの行に書いてもよい。/test/foo のようなパスはコマンドにしない。
   // /release・/pre-release は 1 行目だけ (手順の説明やコードブロックの中の行でタグとリリースを作らないため)
-  const commands = lines.map(l => l.match(/^\/(self-assign|repro|explain|ca|jht|test-repro|test-jht|test-explain|test|pack|pre-release|release|help)(?=\s|$)\s*(.*)$/))
+  const matched = lines.map(l => l.match(/^\/(self-assign|repro|explain|ca|jht|test-jht|test-explain|test|pack|pre-release|release|help|learn)(?=\s|$)\s*(.*)$/))
     .filter((m, i) => m && (i === 0 || !['release', 'pre-release'].includes(m[1])));
-  if (commands.length === 0 || event.comment.user?.type === 'Bot') return output({ action: 'none' });
+  if (matched.length === 0 || event.comment.user?.type === 'Bot') return output({ action: 'none' });
+  // /learn は、同じコメントの /repro・/ca の前に学習させる手順 (学習した後で起きる誤変換を再現する)
+  const lessons = matched.filter(([, c]) => c === 'learn').map(([, , r]) => learnRequest(r));
+  const commands = matched.filter(([, c]) => c !== 'learn');
+  if (lessons.length > 0) {
+    const fail = text => upsertComment(issue, `error-${event.comment.id}`, `${text}\n\n${Help}`);
+    if (!['repro', 'ca'].includes(commands[0]?.[1])) {
+      await fail('`/learn` は、`/repro` か `/ca` と同じコメントに書いてください。');
+      return output({ action: 'none' });
+    }
+    if (lessons.length > MaxLessons) {
+      await fail(`\`/learn\` は 1 つのコメントに ${MaxLessons} 個までです。`);
+      return output({ action: 'none' });
+    }
+    if (!lessons.every(l => isKeys(l.keys) && l.text.length <= MaxLessonText)) {
+      await fail(`\`/learn\` には、打ったキーを英字で書き、確定した語は ${MaxLessonText} 文字までにしてください (例: \`/learn niti → （日）\`)。`);
+      return output({ action: 'none' });
+    }
+  }
   if (commands.length > 1 && !commands.every(([, c]) => c === 'repro')) {
     await upsertComment(issue, `error-${event.comment.id}`, `1 つのコメントに書けるコマンドは 1 つです (\`/repro\` だけは 1 行に 1 つずつ ${MaxRepros} 個まで書けます)。`);
     return output({ action: 'none' });
@@ -207,7 +227,7 @@ async function parse() {
     return output({ action: 'none' });
   }
   const [, command, rest] = commands[0];
-  const prOnly = ['test', 'pack', 'test-repro', 'test-jht', 'test-explain'];
+  const prOnly = ['test', 'pack', 'test-jht', 'test-explain'];
 
   if (command === 'release' || command === 'pre-release') {
     // 権限の広い処理は parse では行わない (parse はだれのコメントでも動くので、権限は contents: read のまま)。
@@ -230,31 +250,28 @@ async function parse() {
     await upsertComment(issue, `help-${event.comment.id}`, Help);
     return output({ action: 'none' });
   }
+  // PR のコードを動かすのは、メンテナーが確かめた commit だけ。コメントの後に head を差し替えられても、見ていないコードは動かさない。
+  // 40 桁の完全一致だけを受け付ける (短い前方一致だと、先頭が同じ無害な commit と悪意のある commit を作って差し替えられる)
+  // 通れば PR の head を返し、通らなければ理由をコメントして null を返す
+  const verifiedHead = async (sha, usage) => {
+    const fail = async text => { await upsertComment(issue, `error-${event.comment.id}`, text); return null; };
+    const name = command === 'repro' ? '/repro <SHA>' : `/${command}`;
+    if (!isPr) return fail(`\`${name}\` は Pull Request でだけ使えます。`);
+    if (!maintainer) return fail(`\`${name}\` はメンテナーだけが使えます (Pull Request のコードを動かすため)。`);
+    const head = (await gh('GET', `/pulls/${issue}`)).head.sha;
+    if (sha === head) return head;
+    const why = isSha(sha) ? `\`${sha}\` は PR の今の head と違います。` : `\`/${command}\` には、中身を確かめた commit の SHA (40 桁) を付けてください。`;
+    return fail(`${why}今の head は \`${head}\` です。確かめてから \`/${command} ${head}${usage}\` と書いてください。`);
+  };
+
   if (prOnly.includes(command)) {
-    if (!isPr) {
-      await upsertComment(issue, `error-${event.comment.id}`, `\`/${command}\` は Pull Request でだけ使えます。`);
-      return output({ action: 'none' });
-    }
-    if (!maintainer) {
-      await upsertComment(issue, `error-${event.comment.id}`, `\`/${command}\` はメンテナーだけが使えます (Pull Request のコードを動かすため)。`);
-      return output({ action: 'none' });
-    }
-    const pr = await gh('GET', `/pulls/${issue}`);
-    // メンテナーが確かめた commit だけを動かす。コメントの後に head を差し替えられても、見ていないコードは動かさない。
-    // 40 桁の完全一致だけを受け付ける (短い前方一致だと、先頭が同じ無害な commit と悪意のある commit を作って差し替えられる)
     const given = rest.trim().split(/\s+/)[0];
-    const sha = given.replace(/^`|`$/g, '').toLowerCase();
     const args = rest.trim().slice(given.length).trim();
-    const head = pr.head.sha;
-    if (!/^[0-9a-f]{40}$/.test(sha) || sha !== head) {
-      const usage = { 'test-repro': ' <キー>', 'test-jht': ' <文>', 'test-explain': ' <キー>' }[command] ?? '';
-      const why = /^[0-9a-f]{40}$/.test(sha) ? `\`${sha}\` は PR の今の head と違います。` : `\`/${command}\` には、中身を確かめた commit の SHA (40 桁) を付けてください。`;
-      await upsertComment(issue, `error-${event.comment.id}`, `${why}今の head は \`${head}\` です。確かめてから \`/${command} ${head}${usage}\` と書いてください。`);
-      return output({ action: 'none' });
-    }
+    const head = await verifiedHead(unquote(given).toLowerCase(), { 'test-jht': ' <文>', 'test-explain': ' <キー>' }[command] ?? '');
+    if (!head) return output({ action: 'none' });
     await react('eyes');
     if (command === 'test' || command === 'pack') {
-      return output({ action: command, issue, sha: pr.head.sha, comment: event.comment.id });
+      return output({ action: command, issue, sha: head, comment: event.comment.id });
     }
     if (command === 'test-jht') {
       const text = args.replace(/^`|`$/g, '');
@@ -262,15 +279,14 @@ async function parse() {
         await upsertComment(issue, `error-${event.comment.id}`, `出てほしい文を書いてください (例: \`/test-jht ${head} 私はgoogleが好きです\` または \`/test-jht ${head} 私はgoogleが好きです / わたしはgoogleがすきです\`)。`);
         return output({ action: 'none' });
       }
-      return output({ action: 'test-jht', issue, keys: text.slice(0, 500), sha: pr.head.sha, comment: event.comment.id });
+      return output({ action: 'test-jht', issue, keys: text.slice(0, 500), sha: head, comment: event.comment.id });
     }
-    const request = command === 'test-repro' ? reproRequest(args) : { keys: keysOf(args) };
-    if (!isKeys(request.keys)) {
+    const keys = keysOf(args);
+    if (!isKeys(keys)) {
       await upsertComment(issue, `error-${event.comment.id}`, `打ったキーを英字で書いてください (例: \`/${command} ${head} nihongowohanasu\`)。`);
       return output({ action: 'none' });
     }
-    if (command === 'test-repro') return output({ action: command, issue, repros: JSON.stringify([request]), reported: '', expected: '', sha: pr.head.sha, comment: event.comment.id });
-    return output({ action: command, issue, keys: request.keys, sha: pr.head.sha, comment: event.comment.id });
+    return output({ action: command, issue, keys, sha: head, comment: event.comment.id });
   }
 
   if (command === 'jht') {
@@ -291,18 +307,44 @@ async function parse() {
     await upsertComment(issue, `error-${event.comment.id}`, `打ったキーを英字で書いてください (例: \`/${command} ${example}\`)。\n\n${Help}`);
     return output({ action: 'none' });
   }
+  // /repro <SHA> は、PR・PR の前 (main との merge base)・main の commit で打って比べる。どの行にも同じ SHA を書く
+  const shas = new Set(requests.map(r => r.sha));
+  if (shas.size > 1) {
+    await upsertComment(issue, `error-${event.comment.id}`, '`/repro` を複数行書くときは、どの行にも同じ SHA を付けるか、どの行にも付けないでください。');
+    return output({ action: 'none' });
+  }
+  const [sha] = shas;
+  let versions = '';
+  if (sha) {
+    const head = await verifiedHead(sha, ' <キー>');
+    if (!head) return output({ action: 'none' });
+    const main = (await gh('GET', '/git/ref/heads/main')).object.sha;
+    const base = (await gh('GET', `/compare/${main}...${head}`)).merge_base_commit.sha;
+    versions = JSON.stringify([{ name: 'pr', sha: head }, { name: 'base', sha: base }, { name: 'main', sha: main }]);
+  }
   await react('eyes');
   if (command === 'explain') return output({ action: command, issue, keys: requests[0].keys, comment: event.comment.id });
-  return output({ action: command, issue, repros: JSON.stringify(requests), reported: '', expected: '', comment: event.comment.id });
+  // 手順は Repro.cs の --learn に「打ったキー → 確定した語」で渡す
+  const learn = lessons.map(l => l.text ? `${l.keys} → ${l.text}` : l.keys);
+  return output({ action: command, issue, repros: JSON.stringify(requests.map(({ keys, last }) => ({ keys, last, learn }))), versions, reported: '', expected: '', comment: event.comment.id });
 }
 
-const keysOf = text => text.trim().split(/\s+/).join(' ').replace(/^`|`$/g, '').slice(0, MaxKeys);
+const unquote = text => text.replace(/^`|`$/g, '');
+const isSha = text => /^[0-9a-f]{40}$/.test(text);
+const keysOf = text => unquote(text.trim().split(/\s+/).join(' ')).slice(0, MaxKeys);
 
-// /repro・/test-repro の「<打ったキー> [space|enter|none]」
+// /learn の「<打ったキー> [→ <確定した語>]」。→ の代わりに前後に空白のある -> も使える (キーの - と > を分けるため)
+function learnRequest(text) {
+  const [keys, word = ''] = text.split(/\s*→\s*|\s+->\s+/, 2);
+  return { keys: keysOf(keys), text: unquote(word.trim()) };
+}
+
+// /repro の「[<SHA>] <打ったキー> [space|enter|none]」
 function reproRequest(text) {
   const words = text.trim().split(/\s+/);
+  const sha = words.length > 1 && isSha(unquote(words[0]).toLowerCase()) ? unquote(words.shift()).toLowerCase() : undefined;
   const last = ['space', 'enter', 'none'].includes(words.at(-1)) && words.length > 1 ? words.pop() : 'enter';
-  return { keys: keysOf(words.join(' ')), last };
+  return { sha, keys: keysOf(words.join(' ')), last };
 }
 
 // 改行は空白にする (空行でコードスパンが切れ、後ろが Markdown として表示されるため)
@@ -347,15 +389,54 @@ async function report() {
   const runUrl = `${process.env.GITHUB_SERVER_URL}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const keys = process.env.BOT_KEYS;
 
-  // repro・ca の結果は results/<repros の番号>/repro-<版>.json
+  // repro・ca の結果は results/<repros の番号>/repro-<版>.json。/repro <SHA> の版は BOT_VERSIONS の name で、その順に並べる
   const repros = JSON.parse(process.env.BOT_REPROS || '[]');
+  const versions = JSON.parse(process.env.BOT_VERSIONS || '[]');
+  const order = name => versions.findIndex(v => v.name === name);
   const reproResults = i => {
     const sub = path.join(dir, String(i));
     const files = fs.existsSync(sub) ? fs.readdirSync(sub).filter(f => f.startsWith('repro-')).sort() : [];
-    return files.map(file => ({ name: file.replace(/^repro-/, '').replace(/\.json$/, ''), r: readJson(path.join(sub, file)) }));
+    return files.map(file => ({ name: file.replace(/^repro-/, '').replace(/\.json$/, ''), r: readJson(path.join(sub, file)) }))
+      .sort((a, b) => order(a.name) - order(b.name));
   };
+  // /repro <SHA> は同じ commit の版を 1 度だけ打つので、その commit の版の名前を = でつなぐ (例: PR の前 = main)
+  const VersionLabels = { pr: 'PR', base: 'PR の前', main: 'main' };
+  const versionLabel = name => {
+    const sha = versions.find(v => v.name === name)?.sha;
+    if (!sha) return name;
+    return `${versions.filter(v => v.sha === sha).map(v => VersionLabels[v.name]).join(' = ')} (${sha.slice(0, 7)})`;
+  };
+  // repro の結果は Mozc だけのもの (一番上) と、Zenzai も使ったもの (zenzai。Zenzai を使えなかったら zenzai.error) の 2 つ。
+  // zenzai が無いのは Zenzai を試さない版 (Repro.cs が zenzai を出す前の版) で、表には — を出す
+  const typedOf = r => (r.committed ?? '') + (r.composing ?? '');
+  const outcomeCell = r => {
+    if (!r) return '—';
+    if (r.error) return `⚠️ ${md(r.error)}`;
+    const typed = typedOf(r);
+    return cell(typed) + (r.converted && r.converted !== typed ? ` / Space: ${cell(r.converted)}` : '');
+  };
+  // /learn の手順。learned (手順ごとに確定したもの) が無いのは、学習に対応する前の版 (結果は学習していない)
+  const lessonOf = text => { const [keys, word] = text.split(' → '); return { keys, word }; };
+  const unlearned = (learn, r) => learn?.length > 0 && r && !r.error && !Array.isArray(r.learned);
+  const learnNotes = (learn, results) => {
+    if (!(learn?.length > 0)) return [];
+    const lines = [`先に別の入力欄で打って確定し、学習させました: ${learn.map(lessonOf).map(l => code(l.keys) + (l.word ? ` → ${cell(l.word)}` : '')).join('、')}`];
+    for (const { name, r } of results) {
+      if (unlearned(learn, r)) { lines.push(`ℹ️ ${md(versionLabel(name))} は学習に対応していない版なので、学習させずに打ちました。`); continue; }
+      learn.map(lessonOf).forEach((l, i) => {
+        const committed = r?.learned?.[i];
+        if (l.word && committed != null && committed !== l.word) lines.push(`⚠️ ${md(versionLabel(name))}: ${code(l.keys)} の候補に ${cell(l.word)} が無く、${cell(committed)} と確定しました。`);
+      });
+    }
+    return [...lines, ''];
+  };
+  const usable = o => o && !o.error;
+  const outcomes = r => [r, r.zenzai].filter(usable);
+  // Zenzai の結果は、どちらの版でも使えたときだけ比べる
+  const sameOutcome = (a, b) => outcomeCell(a) === outcomeCell(b)
+    && (!usable(a.zenzai) || !usable(b.zenzai) || outcomeCell(a.zenzai) === outcomeCell(b.zenzai));
 
-  if (action === 'repro' || action === 'test-repro') {
+  if (action === 'repro') {
     const marker = process.env.BOT_COMMENT_ID ? `repro-${process.env.BOT_COMMENT_ID}` : 'repro';
     const reported = process.env.BOT_REPORTED, expected = process.env.BOT_EXPECTED;
     const runs = repros.map((r, i) => ({ ...r, results: reproResults(i) }));
@@ -365,32 +446,38 @@ async function report() {
     }
     const sections = [], verdicts = [];
     let engine = '';
-    for (const { keys, last, results } of runs) {
+    for (const { keys, last, learn, results } of runs) {
       if (results.length === 0) {
         sections.push(`${code(keys)} は再現を試せませんでした。`);
         continue;
       }
+      const withZenzai = results.some(v => v.r?.zenzai);
       const rows = [];
       let verdict;
       for (const { name, r } of results) {
-        if (!r) { rows.push(`| ${md(name)} | (失敗) |`); continue; }
+        if (!r) { rows.push(`| ${md(versionLabel(name))} | (失敗) |${withZenzai ? ' (失敗) |' : ''}`); continue; }
         if (r.engine) engine = r.engine;
-        const result = (r.committed ?? '') + (r.composing ?? '');
-        const extra = r.converted && r.converted !== result ? ` / Space: ${cell(r.converted)}` : '';
-        rows.push(`| ${md(name)} | ${cell(result)}${extra} |`);
-        if ((name === 'main' || name === 'pr') && !verdict) {
-          if (expected && (result === expected || r.converted === expected)) verdict = 'match';
-          else if (reported && (result === reported || r.converted === reported)) verdict = 'reproduced';
+        rows.push(`| ${md(versionLabel(name))} | ${outcomeCell(r)} |${withZenzai ? ` ${outcomeCell(r.zenzai)} |` : ''}`);
+        if ((name === 'main' || name === 'pr') && !verdict && !unlearned(learn, r)) {
+          // Mozc だけか Mozc + Zenzai のどちらかで報告と同じなら、もう一方が期待どおりでも再現とする
+          // (Zenzai が遅い PC では Mozc の結果になる。アプリは Zenzai が既定で ON)
+          const texts = outcomes(r).flatMap(o => [typedOf(o), o.converted]);
+          if (reported && texts.includes(reported)) verdict = 'reproduced';
+          else if (expected && texts.includes(expected)) verdict = 'match';
           else verdict = 'different';
         }
       }
       verdicts.push(verdict);
+      const pr = results.find(v => v.name === 'pr')?.r, base = results.find(v => v.name === 'base')?.r;
+      const change = pr && base ? (sameOutcome(pr, base) ? 'PR の前と同じ結果です。' : 'PR で結果が変わりました。') : '';
       sections.push([
-        `${code(keys)} を打ってみました (最後のキー: ${last}${action === 'test-repro' ? `、PR ${process.env.BOT_SHA?.slice(0, 7)}` : ''})。`,
+        ...learnNotes(learn, results),
+        `${code(keys)} を打ってみました (最後のキー: ${last})。`,
         '',
-        '| 版 | 結果 |',
-        '|---|---|',
+        withZenzai ? '| 版 | Mozc | Mozc + Zenzai |' : '| 版 | 結果 |',
+        withZenzai ? '|---|---|---|' : '|---|---|',
         ...rows,
+        ...(change ? ['', change] : []),
       ].join('\n'));
     }
     const hasMozc = /Mozc/i.test(engine);
@@ -398,7 +485,7 @@ async function report() {
     if (!hasMozc) lines.push('ℹ️ Mozc の変換ヘルパーが使えなかったため、**漢字変換は検証していません** (日本語 / 英語の判定と入力結果のみ)。');
     else if (verdicts.includes('reproduced')) lines.push('🔁 報告と同じ結果になりました。**再現しました。**');
     else if (verdicts.includes('match')) lines.push('✅ 最新のコードでは期待どおりでした。次の版で直っているかもしれません。');
-    else if (expected || reported) lines.push('報告とは違う結果になりました。アプリ・前後の文・学習で変わることがあります。');
+    else if (expected || reported) lines.push('報告とは違う結果になりました。アプリ・前後の文・学習で変わることがあります (学習は `/learn` で先に学習させてから試せます)。');
     lines.push('', `<sub>変換エンジン: ${engine ? md(engine) : 'なし (判定だけ)'}。${!hasMozc ? '漢字の正しさは未確認。' : ''}[実行結果](${runUrl})</sub>`);
     await upsertComment(issue, marker, lines.join('\n'));
     if (verdicts.includes('reproduced')) await gh('POST', `/issues/${issue}/labels`, { labels: ['再現済み'] }).catch(() => {});
@@ -428,6 +515,7 @@ async function report() {
     };
     const names = results.map(v => md(v.name));
     const lines = [
+      ...learnNotes(repros[0]?.learn, results),
       `${code(keys)} を Space で変換しました。`,
       '',
       '| 版 | 文節 |',
@@ -508,8 +596,8 @@ async function report() {
   if (action === 'pack') {
     const ok = process.env.BOT_JOB_RESULT === 'success';
     await upsertComment(issue, `pack-${process.env.BOT_COMMENT_ID}`, ok
-      ? `📦 テスト版の zip を作りました (${process.env.BOT_SHA?.slice(0, 7)})。[実行結果](${runUrl}) の Artifacts の **meltype-pr-${issue}** からダウンロードできます (Windows 用)。`
-      : `❌ zip を作れませんでした。[実行結果](${runUrl})`);
+      ? `📦 テスト版のインストーラー (setup.exe) を作りました (${process.env.BOT_SHA?.slice(0, 7)})。[実行結果](${runUrl}) の Artifacts の **meltype-pr-${issue}** からダウンロードできます (Windows 用)。`
+      : `❌ インストーラーを作れませんでした。[実行結果](${runUrl})`);
   }
 }
 

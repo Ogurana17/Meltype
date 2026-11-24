@@ -9,34 +9,9 @@ namespace Meltype;
 
 internal static class Program
 {
-    /// <summary>
-    /// 語ごとの自動の判定 (学習は使わない)。今の版の判定にも同じものを使う (<see cref="Updater.PreviewChanges"/>)。
-    /// </summary>
-    internal static string JudgeWords(IEnumerable<string> words)
-    {
-        var detector = Composition.CompositionDetector.CreateDefault();
-        if (Detection.WindowsSpellChecker.Shared.IsAvailable) detector.SpellChecker = Detection.WindowsSpellChecker.Shared;
-        return Composition.WordJudge.JudgeAll(detector, words);
-    }
-
-    private static int JudgeWords(string input, string output)
-    {
-        try
-        {
-            File.WriteAllText(output, JudgeWords(File.ReadAllLines(input)));
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine(ex.Message);
-            return 1;
-        }
-    }
-
     [STAThread]
     private static int Main(string[] args)
     {
-        using var spellChecker = Detection.WindowsSpellChecker.Shared;
         // Meltype.exe --version: 版だけを出して終わる (フック・UI は起動しない)。
         // WinExe はコンソールを持たないので、親ターミナル (cmd / PowerShell) に付け直してから書く。
         if (args.FirstOrDefault() == "--version")
@@ -50,16 +25,10 @@ internal static class Program
         if (args.FirstOrDefault() == "--selftest") return SelfTest.Run(args.ElementAtOrDefault(1));
         // Meltype.exe --exit: 動いている Meltype を終了させる (インストール・アンインストール用。管理者として動いていても止められる)。
         if (args.FirstOrDefault() == "--exit") return ExitSignal.Send() ? 0 : 1;
-        // Meltype.exe --judge-words <語の一覧> <結果>: 語ごとの自動の判定を書き出す。前の版の Meltype が、更新の前に
-        // 「あなたの打ち方で変わる語」を調べるために、ダウンロードした新しい版をこれで動かす (issue #285)。
-        if (args.FirstOrDefault() == "--judge-words" && args.Length >= 3) return JudgeWords(args[1], args[2]);
 
         // フックを二重に掛けると同じ打鍵を二重に保留・再入力してしまうので、多重起動させない。
         using var mutex = new Mutex(initiallyOwned: true, @"Local\Meltype.SingleInstance", out var createdNew);
-        // Meltype.exe --restore <バックアップ>: 動いている Meltype が終わるのを待ってから、バックアップを戻して起動する
-        // (動いている Meltype が終わるときに学習データを書き戻すので、戻すのはその後)。
-        var restore = args.FirstOrDefault() == "--restore" ? args.ElementAtOrDefault(1) : null;
-        if (!createdNew && (restore is null || !WaitForExit(mutex))) return 0;
+        if (!createdNew) return 0;
 
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -69,7 +38,7 @@ internal static class Program
             Log.Error($"未処理の例外: {e.ExceptionObject}");
             Log.FlushFile();
             WriteCrashLog(e.ExceptionObject);
-            Composition.LearningSaves.FlushAll();
+            Config.LearningSaves.FlushAll();
         };
 
         if (!AppPaths.IsPortable) AppPaths.MigrateFromOldName();
@@ -84,7 +53,6 @@ internal static class Program
                 "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
-        if (restore is not null) RestoreBackup(restore);
         var state = AppState.Load(AppPaths.StateFile, AppPaths.ConfigFile);
         var settings = Settings.Load(AppPaths.ConfigFile);
         if (!File.Exists(AppPaths.ConfigFile))
@@ -92,19 +60,18 @@ internal static class Program
             try { settings.Save(AppPaths.ConfigFile); } catch { }
         }
 
-        // ダウンロード済みの新しい版があれば、起動せずに更新する (install.ps1 が新しい版を起動する)。
-        if (!AppPaths.IsPortable && Updater.ApplyStagedAtStartup(() => settings.AutoUpdate, settings.UpdatePrerelease,
-                version => UpdateChangesDialog.Confirm(new Composition.LanguageMemory(AppPaths.LanguageMemoryFile), version, settings))) return 0;
+        // ダウンロード済みの新しい版があれば、起動せずに更新する (インストーラーが新しい版を起動する)。
+        if (!AppPaths.IsPortable && Updater.ApplyStagedAtStartup(() => settings.AutoUpdate, settings.UpdatePrerelease)) return 0;
 
         // 学習データは確定のたびに書かず、少し後にまとめて書く。終了・ログオフのときに残りを書く
         // (更新の確認は学習データを別に読み込んで書くので、それより後で切り替える)
-        Composition.LearningSaves.Deferred = true;
-        Microsoft.Win32.SystemEvents.SessionEnding += (_, _) => Composition.LearningSaves.FlushAll();
+        Config.LearningSaves.Deferred = true;
+        Microsoft.Win32.SystemEvents.SessionEnding += (_, _) => Config.LearningSaves.FlushAll();
 
         MeltypeEngine engine;
         try
         {
-            engine = new MeltypeEngine(Composition.MeltypeRuntime.OpenDefault(Detection.WindowsSpellChecker.Shared));
+            engine = new MeltypeEngine(Ime.MeltypeRuntime.OpenDefault());
             engine.Start();
         }
         catch (Exception ex)
@@ -122,7 +89,7 @@ internal static class Program
             using var exitSignal = new ExitSignal();
             Application.Run(new TrayApplicationContext(engine, state));
         }
-        Composition.LearningSaves.FlushAll();
+        Config.LearningSaves.FlushAll();
         return 0;
     }
 
@@ -141,39 +108,6 @@ internal static class Program
         catch
         {
             // 書けなくても、元の例外の処理を続ける
-        }
-    }
-
-    /// <summary>前の Meltype が終わる (単一起動の印が空く) のを待つ。</summary>
-    private static bool WaitForExit(Mutex mutex)
-    {
-        try
-        {
-            return mutex.WaitOne(TimeSpan.FromSeconds(15));
-        }
-        catch (AbandonedMutexException)
-        {
-            // 前の Meltype が印を返さずに終わった: 取れたことになる
-            return true;
-        }
-    }
-
-    private static void RestoreBackup(string path)
-    {
-        try
-        {
-            var count = Backup.Restore(File.ReadAllBytes(path), AppPaths.DataDirectory);
-            Log.Info($"バックアップから {count} 個のファイルを戻しました。");
-            MessageBox.Show($"バックアップを戻しました ({count} 個のファイル)。\n今までのファイルは、データフォルダーに .before-restore として残しています。", "Meltype",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"バックアップを戻せませんでした。\n\n{ex.Message}", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-        finally
-        {
-            try { File.Delete(path); } catch { }
         }
     }
 }

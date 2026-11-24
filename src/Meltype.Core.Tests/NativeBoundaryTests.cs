@@ -3,11 +3,12 @@
 
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Meltype.CApi;
 using Meltype.Composition;
 using Meltype.Config;
+using Meltype.Dictionary;
 using Meltype.Ime;
 using Meltype.Input;
-using Meltype.Mac;
 
 namespace Meltype.Tests;
 
@@ -19,19 +20,18 @@ internal static unsafe class NativeBoundaryTests
     {
         private readonly GCHandle _handle;
 
-        public NativeSession() => _handle = GCHandle.Alloc(new ImeHost(this, () => Settings));
+        public NativeSession() =>
+            _handle = GCHandle.Alloc(new ImeHost(this, new SessionParts(CompositionTests.Detector, new CompositionTests.FakeConverter(), new CompositionServices()), () => Settings));
 
         public Settings Settings { get; } = new() { SpaceAroundEnglish = true, LiveConversion = false };
 
         public InputMode? InputMethod => null;
 
-        public MeltypeSession CreateSession(Func<Settings> settings) => new(CompositionTests.Detector, new CompositionTests.FakeConverter(),
-            new CompositionServices(), settings);
-
-
         public SnippetStore Snippets { get; } = new(null);
 
         public string? ClipboardText => null;
+
+        public string? OtherTipVersion => null;
 
         /// <summary>最後の応答で変換中の文字があったか。</summary>
         public bool IsComposing { get; private set; }
@@ -162,7 +162,7 @@ internal static unsafe class NativeBoundaryTests
     }
 
     [Test]
-    public static void Native_CombiningMarksAttachBeforeAutomaticEnglishSpacing()
+    public static void Native_CombiningMarksAttachBeforeEnglishSpacing()
     {
         foreach (var mark in new[] { 0x3099, 0xFE0F, 0xE0100 })
         {
@@ -183,7 +183,8 @@ internal static unsafe class NativeBoundaryTests
     {
         using var native = new NativeSession();
         native.Type("ka", after: "world");
-        using var result = native.Key(0, VirtualKeys.Return);
+        // キャレットの前後は出来事ごとにフロントが送ったものを使う (フロントはキーのたびに送る)
+        using var result = native.Key(0, VirtualKeys.Return, after: "world");
         Assert.True(result.RootElement.GetProperty("consumed").GetBoolean(), "通常の Enter は消費する");
         Assert.Equal("か ", result.RootElement.GetProperty("commits")[0].GetProperty("text").GetString());
     }

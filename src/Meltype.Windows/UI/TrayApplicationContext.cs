@@ -34,12 +34,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly HashSet<string> _outdatedApps = new(StringComparer.OrdinalIgnoreCase);
     private readonly Keyboard.KeyboardFront _keyboard;
     private readonly ToolStripMenuItem _tsfModeItem;
-    private SettingsForm? _settingsForm;
     private LogForm? _logForm;
-    private UserDictionaryForm? _dictionaryForm;
-    private SnippetsForm? _snippetsForm;
     private ReportDialog? _reportDialog;
-    private LearnedWordsForm? _learnedForm;
     private KeyCountForm? _keyCountForm;
     private WelcomeForm? _welcomeForm;
     private readonly Updater _updater;
@@ -55,12 +51,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _invoker.CreateControl();
         // 入力・表示は、動かしている設定 (Meltype IME を使えなければ Meltype キーボード) を読む
         _composition = new Composition.CompositionService(_invoker, _engine.Runtime, () => _engine.Running);
-        _keyboard = new Keyboard.KeyboardFront(_invoker, _composition, environment => new Ime.ImeHost(environment, () => _engine.Running));
+        _keyboard = new Keyboard.KeyboardFront(_invoker, _composition, environment => _composition.CreateHost(environment, () => _engine.Running), () => _engine.OtherTipVersion);
         _keyboard.ModeChanged += OnKeyboardModeChanged;
         _engine.Keyboard = _keyboard;
         _engine.Focus = _composition.Focus;
         _composition.Focus.TextInputEntered += _engine.OnTextInputEntered;
-        _tipServer = new Tip.TipServer(_invoker, _composition, environment => new Ime.ImeHost(environment, () => _engine.Running));
+        _tipServer = new Tip.TipServer(_invoker, _composition, environment => _composition.CreateHost(environment, () => _engine.Running));
         _engine.ImeServer = _tipServer;
         _tipServer.ClientOutdated += process =>
         {
@@ -86,7 +82,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _statusItem = new ToolStripMenuItem { Enabled = false };
         _enabledItem = new ToolStripMenuItem("Meltype を有効にする", null, (_, _) => ToggleEnabled()) { CheckOnClick = false };
         _keyboardModeItem = new ToolStripMenuItem("Meltype キーボード (変換ボックスで入力)", null, (_, _) => SetMode(InputMode.Keyboard));
-        _tsfModeItem = new ToolStripMenuItem("Meltype IME (入力欄に直接入力)", null, (_, _) => SetMode(InputMode.Tsf));
+        _tsfModeItem = new ToolStripMenuItem("Meltype IME (入力欄に直接入力)", null, (_, _) => SelectTsf());
         menu.Items.Add(_statusItem);
         menu.Items.Add(_zenzaiItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -109,33 +105,22 @@ internal sealed class TrayApplicationContext : ApplicationContext
             menu.Items.Add(startup);
         }
         menu.Items.Add("使い方...", null, (_, _) => ShowWelcome());
-        menu.Items.Add("設定...", null, (_, _) => ShowSettings());
-        menu.Items.Add("ユーザー辞書...", null, (_, _) => ShowUserDictionary());
-        menu.Items.Add("定型文...", null, (_, _) => ShowSnippets());
+        // 設定・ユーザー辞書・定型文・学習データ・バックアップは、設定アプリ (MeltypeSettings.exe) で扱う
+        menu.Items.Add("設定・辞書・学習データ...", null, (_, _) => SettingsApp.Open());
         menu.Items.Add("ログ / 判定理由...", null, (_, _) => ShowLog());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("データフォルダを開く", null, (_, _) => OpenDataFolder());
-        var backup = new ToolStripMenuItem("バックアップ");
-        backup.DropDownItems.Add("バックアップを書き出す...", null, (_, _) => CreateBackup());
-        backup.DropDownItems.Add("バックアップから戻す...", null, (_, _) => RestoreBackup());
-        menu.Items.Add(backup);
         menu.Items.Add("不具合の報告・提案...", null, (_, _) => OpenReport());
         menu.Items.Add("直した誤判定を報告...", null, (_, _) => new CorrectionReportDialog(_composition.Corrections, _engine.Running).Show());
         menu.Items.Add("Meltype について...", null, (_, _) => MessageBox.Show(AppInfo.AboutText, "Meltype について", MessageBoxButtons.OK, MessageBoxIcon.Information));
-        menu.Items.Add("学習した語...", null, (_, _) => ShowLearnedWords());
         menu.Items.Add("打鍵数...", null, (_, _) => ShowKeyCount());
-        var forget = new ToolStripMenuItem("学習データを消す");
-        forget.DropDownItems.Add("この 1 時間に覚えたもの...", null, (_, _) => ForgetRecentLearning(DateTime.UtcNow.AddHours(-1), "この 1 時間"));
-        forget.DropDownItems.Add("今日覚えたもの...", null, (_, _) => ForgetRecentLearning(DateTime.Today.ToUniversalTime(), "今日"));
-        forget.DropDownItems.Add("すべて (リセット)...", null, (_, _) => ResetLearning());
-        menu.Items.Add(forget);
         if (!AppPaths.IsPortable) menu.Items.Add("アンインストール...", null, (_, _) => Uninstall());
         // 更新: 自動更新の ON/OFF、今すぐ確認、ダウンロード済みなら更新して再起動
         var updates = new ToolStripMenuItem("更新");
         _autoUpdateItem = new ToolStripMenuItem("自動で更新する", null, (_, _) => ToggleAutoUpdate());
         updates.DropDownItems.Add(_autoUpdateItem);
         updates.DropDownItems.Add("今すぐ更新を確認", null, (_, _) => CheckForUpdate());
-        updates.DropDownItems.Add("リリースノート...", null, (_, _) => ReleaseNotesDialog.ShowFor(AppInfo.Version, updated: false));
+        updates.DropDownItems.Add("リリースノート...", null, (_, _) => ReleaseNotesDialog.ShowFor(AppInfo.Version, updated: false, _engine));
         _updateItem = new ToolStripMenuItem("", null, (_, _) => ApplyUpdate()) { Visible = false };
         updates.DropDownItems.Add(_updateItem);
         updates.DropDownOpening += (_, _) =>
@@ -162,7 +147,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         UpdateStatus();
         // 前回の更新に失敗していたら知らせる (設定「通知を表示」にかかわらず。入力を止めないように、ダイアログではなく通知にする)
         if (Updater.FailedVersion is { } failed)
-            _invoker.BeginInvoke(() => _tray.ShowBalloonTip(10000, "Meltype - 更新失敗", UpdateFailedMessage(failed), ToolTipIcon.Warning));
+            _invoker.BeginInvoke(() => _tray.ShowBalloonTip(10000, "Meltype - 更新失敗", UpdateFailedMessage(failed, _engine.Settings.AutoUpdate), ToolTipIcon.Warning));
         // 初めて起動したら使い方を見せる (見せたことは state.json に残す)
         var firstRun = !_state.WelcomeShown;
         if (firstRun)
@@ -172,23 +157,22 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _invoker.BeginInvoke(ShowWelcome);
         }
         // 更新したあとの初めての起動なら、その版のリリースノートを一度だけ見せる (issue #1207)。
-        // 初めて起動した人には見せず、今の版を見せたことにしておく
-        if (_state.ReleaseNotesShown != AppInfo.Version)
-        {
-            var showNotes = ProjectInfo.ShouldShowReleaseNotes(_state.ReleaseNotesShown, AppInfo.Version, firstRun);
-            _state.ReleaseNotesShown = AppInfo.Version;
-            _state.Save();
-            if (showNotes) _invoker.BeginInvoke(() => ReleaseNotesDialog.ShowFor(AppInfo.Version, updated: true));
-        }
+        // 設定で自動表示を OFF にしていれば見せない
+        if (TakeReleaseNotes(_state, AppInfo.Version, firstRun, _engine.Settings.ShowReleaseNotesAfterUpdate))
+            _invoker.BeginInvoke(() => ReleaseNotesDialog.ShowFor(AppInfo.Version, updated: true, _engine));
         // Meltype IME が入る前の版から更新した人に、一度だけ Meltype IME を入れるかを聞く
         // (初めて起動した人には、インストーラーが聞いている)
         if (!AppPaths.IsPortable && !_state.TsfOffered)
         {
             _state.TsfOffered = true;
             _state.Save();
-            if (!firstRun && CanOfferTsf()) _invoker.BeginInvoke(OfferTsf);
+            if (!firstRun && CanRegisterTsf && !_state.TsfIntroduced && Tip.TipServer.IsKnownUnregistered) _invoker.BeginInvoke(() => EnableTsf(
+                "Meltype IME を入れますか？\n\n" +
+                "Meltype IME は Windows の IME として、打った文字を入力欄に直接入れます。変換ボックスが出ないアプリでも入力できます。「いいえ」なら、今の動作モードのまま使えます。"));
         }
-        if (CanOfferTsfUpdate()) _invoker.BeginInvoke(OfferTsfUpdate);
+        // 動作モードが Meltype IME なのに、登録済みの impl がこの Meltype.exe と別ビルドで、Meltype キーボードで動いている
+        // (登録した人が別の版の Meltype に更新した・同じ PC のほかのユーザーが別の版を入れた)。聞いたことは覚えず、起動のたびに聞く
+        if (CanRegisterTsf && _engine.Settings.Mode == InputMode.Tsf && Tip.TipServer.IsOtherBuildRegistered) _invoker.BeginInvoke(OfferTsfUpdate);
         // 起動時の設定反映が終わってから、読み込み中に蓄積した除外をまとめて通知する。
         Diagnostics.ShortcutExclusions.Added += OnShortcutExcluded;
         OnShortcutExcluded();
@@ -197,60 +181,35 @@ internal sealed class TrayApplicationContext : ApplicationContext
     /// <summary>
     /// Meltype IME (TSF) を入れたら、一度だけ動作モードを Meltype IME にする
     /// (PC に登録されていても、このユーザーのキーボードの一覧に無ければ Win + Space で選べないので切り替えない)
-    /// (ARM64 の Windows には Meltype IME は対応していないので切り替えない)
     /// </summary>
     private void IntroduceTsf()
     {
-        if (AppPaths.IsPortable || _state.TsfIntroduced || !Tip.TipServer.IsRegistered || !Tip.TipServer.IsInUserLanguageList ||
-            RuntimeInformation.OSArchitecture == Architecture.Arm64) return;
+        if (AppPaths.IsPortable || _state.TsfIntroduced || !Tip.TipServer.IsRegistered || !Tip.TipServer.IsInUserLanguageList) return;
         var wasTsf = _engine.Running.Mode == InputMode.Tsf;
         _state.TsfIntroduced = true;
         _state.Save();
-        var next = _engine.Settings.Clone();
-        next.Mode = InputMode.Tsf;
-        _engine.ApplySettings(next);
+        _engine.EditSettings(settings => settings.Mode = InputMode.Tsf);
         // ほかのモードからなら MeltypeEngine.OnSettingsChanged が切り替える。もう Meltype IME のモードだったときも、入力方式を Meltype IME にする
         if (wasTsf) Tip.TipServer.ActivateForSession();
         Diagnostics.Log.Info("Meltype IME が入っているので、動作モードを Meltype IME にしました。");
     }
 
-    /// <summary>
-    /// Meltype IME を入れるかを聞けるか。Meltype IME を使ったことがない・登録されていない・インストール先に meltype-ime.ps1 と DLL がある・
-    /// 前に断っていない (UAC で断ったときと、インストーラーでチェックを外したときに HKCU\Software\Meltype の ImeDeclined に残す) とき。
-    /// </summary>
-    private bool CanOfferTsf()
+    /// <summary>Meltype IME をインストール先の setup-ime.ps1 で登録できるか (ポータブル版・tip フォルダーの無い Meltype.exe では登録できない)。</summary>
+    private static bool CanRegisterTsf => !AppPaths.IsPortable &&
+        File.Exists(Path.Combine(AppContext.BaseDirectory, "setup-ime.ps1")) && Directory.Exists(Path.Combine(AppContext.BaseDirectory, "tip"));
+
+    /// <summary>トレイで Meltype IME を選んだ。使えなければ、登録するかを聞いてから切り替える。</summary>
+    private void SelectTsf()
     {
-        if (_state.TsfIntroduced || !Tip.TipServer.IsKnownUnregistered || RuntimeInformation.OSArchitecture == Architecture.Arm64) return false;
-        if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "meltype-ime.ps1")) || !Directory.Exists(Path.Combine(AppContext.BaseDirectory, "tip"))) return false;
-        try
-        {
-            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Meltype");
-            return key?.GetValue("ImeDeclined") is not 1;
-        }
-        catch
-        {
-            return false;
-        }
+        if (Tip.TipServer.IsUsable) SetMode(InputMode.Tsf);
+        else EnableTsf("Meltype IME を Windows に登録しますか？\n\n" +
+            "Meltype IME は Windows の IME として、打った文字を入力欄に直接入れます。変換ボックスが出ないアプリでも入力できます。");
     }
 
-    /// <summary>Meltype IME を入れるかを聞き、「はい」なら meltype-ime.ps1 で登録して、動作モードを Meltype IME にする。</summary>
-    private async void OfferTsf()
+    /// <summary>Meltype IME を登録するかを聞き、使えるようになったら動作モードを Meltype IME にする。</summary>
+    private async void EnableTsf(string question)
     {
-        // 起動したときに出すので、ほかのウィンドウの後ろに隠れないように最前面にする
-        using var owner = new Form { TopMost = true };
-        var answer = MessageBox.Show(owner,
-            "Meltype IME を入れますか？\n\n" +
-            "Meltype IME は Windows の IME として、打った文字を入力欄に直接入れます。変換ボックスが出ないアプリでも入力できます。\n\n" +
-            "入れるときに管理者権限の確認が出ます。「いいえ」なら、今の動作モードのまま使えます。",
-            "Meltype IME", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (answer != DialogResult.Yes) return;
-        await RegisterTsf();
-        // 登録できても、キーボードの一覧に足せなければ Win + Space で選べない
-        if (!Tip.TipServer.IsRegistered || !Tip.TipServer.IsInUserLanguageList)
-        {
-            MessageBox.Show("Meltype IME を使えるようにできませんでした。今の動作モードのまま使えます。", "Meltype IME", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
+        if (!await OfferRegisterTsf(question)) return;
         // 次に起動したとき IntroduceTsf で切り替え直さないように、切り替えたことも残す (あとでユーザーが戻したら、そのまま)
         _state.TsfIntroduced = true;
         _state.Save();
@@ -258,45 +217,38 @@ internal sealed class TrayApplicationContext : ApplicationContext
         UpdateStatus();
     }
 
-    /// <summary>
-    /// 登録済みの Meltype IME を、この Meltype.exe に同梱のものに更新するかを聞けるか。動作モードが Meltype IME で、
-    /// 登録済みの impl がこの Meltype.exe と別ビルド (<see cref="Tip.TipServer.IsOtherBuildRegistered"/>) で、インストール先に meltype-ime.ps1 と DLL があるとき。
-    /// ImeDeclined は見ない (断ったあとも Meltype キーボードで動き続けるので、起動のたびに聞く)。
-    /// </summary>
-    private bool CanOfferTsfUpdate() =>
-        !AppPaths.IsPortable && _engine.Settings.Mode == InputMode.Tsf && RuntimeInformation.OSArchitecture != Architecture.Arm64 &&
-        Tip.TipServer.IsOtherBuildRegistered &&
-        File.Exists(Path.Combine(AppContext.BaseDirectory, "meltype-ime.ps1")) && Directory.Exists(Path.Combine(AppContext.BaseDirectory, "tip"));
-
-    /// <summary>登録済みの Meltype IME を更新するかを聞き、「はい」なら meltype-ime.ps1 で再登録して、Meltype IME で動かし直す。</summary>
+    /// <summary>登録済みの Meltype IME を、この Meltype.exe に同梱のものに更新するかを聞き、更新できたら Meltype IME で動かし直す。</summary>
     private async void OfferTsfUpdate()
     {
-        using var owner = new Form { TopMost = true };
-        var answer = MessageBox.Show(owner,
-            "Meltype IME を更新しますか？\n\n" +
-            "Windows に登録されている Meltype IME が、更新前の Meltype のものです。更新するまでは、Meltype キーボード (変換ボックスで入力) で動きます。\n\n" +
-            "更新するときに管理者権限の確認が出ます。",
-            "Meltype IME", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (answer != DialogResult.Yes) return;
-        await RegisterTsf();
-        if (!Tip.TipServer.IsUsable)
-        {
-            MessageBox.Show("Meltype IME を更新できませんでした。Meltype キーボードのまま使えます。", "Meltype IME", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
+        if (!await OfferRegisterTsf("Meltype IME を更新しますか？\n\n" +
+            "Windows に登録されている Meltype IME が、ほかの版の Meltype のものです。更新するまでは、Meltype キーボード (変換ボックスで入力) で動きます。")) return;
         // 動かす動作モード (MeltypeEngine.Running) を決め直す
-        _engine.ApplySettings(_engine.Settings);
+        _engine.EditSettings(_ => { });
         UpdateStatus();
     }
 
-    /// <summary>meltype-ime.ps1 の Install-MeltypeIme で Meltype IME を登録する (UAC の確認が出る)。</summary>
+    /// <summary>聞いて「はい」なら、インストール先の setup-ime.ps1 で Meltype IME を登録する (UAC の確認が出る)。Meltype IME を使えるようになったら true。</summary>
+    private static async Task<bool> OfferRegisterTsf(string question)
+    {
+        // 起動したときにも出すので、ほかのウィンドウの後ろに隠れないように最前面にする
+        using var owner = new Form { TopMost = true };
+        var answer = MessageBox.Show(owner, question + "\n\n次に「Windows PowerShell」の管理者権限の確認が出ます。",
+            "Meltype IME", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer != DialogResult.Yes) return false;
+        await RegisterTsf();
+        // 登録できても、キーボードの一覧に足せなければ Win + Space で選べない
+        if (Tip.TipServer.IsUsable) return true;
+        MessageBox.Show(owner, $"Meltype IME を使えるようにできませんでした。今の動作モードのまま使えます。\n\n記録: {Path.Combine(Path.GetTempPath(), "Meltype-setup-ime.log")}",
+            "Meltype IME", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return false;
+    }
+
+    /// <summary>setup-ime.ps1 で Meltype IME を登録する (UAC の確認が出る)。</summary>
     private static async Task RegisterTsf()
     {
         var directory = AppContext.BaseDirectory;
-        var quote = (string text) => "'" + text.Replace("'", "''") + "'";
         var start = new ProcessStartInfo(Updater.PowerShell) { UseShellExecute = false, CreateNoWindow = true };
-        foreach (var arg in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-            $". {quote(Path.Combine(directory, "meltype-ime.ps1"))}; Install-MeltypeIme -Source {quote(Path.Combine(directory, "tip"))} -Ask | Out-Null" })
+        foreach (var arg in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", Path.Combine(directory, "setup-ime.ps1"), "-Source", Path.Combine(directory, "tip") })
         {
             start.ArgumentList.Add(arg);
         }
@@ -341,8 +293,26 @@ internal sealed class TrayApplicationContext : ApplicationContext
         ? $"Meltype {version} を準備しました。次に Windows にサインインしたときに更新します。ここをクリックすると今すぐ更新します。"
         : $"Meltype {version} を準備しました。トレイの「更新」→「Meltype {version} に更新して再起動」で更新できます。ここをクリックすると今すぐ更新します。";
 
-    internal static string UpdateFailedMessage(string version) =>
-        $"Meltype {version} への更新に失敗しました。今のバージョンで動いています。自動ではもう一度試しません。記録: {Updater.InstallLog}";
+    /// <summary>
+    /// 自動更新が ON なら、Updater がダウンロードし直し、次のサインインでもう一度更新する。
+    /// Meltype IME を更新できなかったとき (UAC を断った) も、インストーラーが本体を入れ替えずに止めるので、この通知になる。
+    /// </summary>
+    internal static string UpdateFailedMessage(string version, bool autoUpdate) => autoUpdate
+        ? $"Meltype {version} に更新できませんでした。今の版のまま動いています。次に Windows にサインインしたときに、もう一度更新します。記録: {Updater.InstallLog}"
+        : $"Meltype {version} に更新できませんでした。今の版のまま動いています。トレイの「更新」→「今すぐ更新を確認」から、もう一度更新できます。記録: {Updater.InstallLog}";
+
+    /// <summary>
+    /// 更新したあとの初めての起動で、その版のリリースノートを出すか決めて、見せた版を state.json に残す (issue #1207)。
+    /// 設定で自動表示を OFF にしていても、初めて起動した人でも、見せたことにしておく (あとで ON に戻しても、その版のは自動では出さない)。
+    /// </summary>
+    internal static bool TakeReleaseNotes(AppState state, string version, bool firstRun, bool autoShow)
+    {
+        if (state.ReleaseNotesShown == version) return false;
+        var show = ProjectInfo.ShouldShowReleaseNotes(state.ReleaseNotesShown, version, firstRun, autoShow);
+        state.ReleaseNotesShown = version;
+        state.Save();
+        return show;
+    }
 
     private void OnUpdateBalloonClicked(object? sender, EventArgs e)
     {
@@ -393,7 +363,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     /// <summary>除外した登録の先頭 3 件をキー名で示し、残り件数とログ画面への案内を付けた通知本文を作る。</summary>
     internal static string ShortcutExclusionMessage(IReadOnlyList<Diagnostics.ShortcutExclusion> excluded)
     {
-        var names = excluded.Take(3).Select(e => e.Shortcut is { } shortcut ? ShortcutEditor.Describe(shortcut) : "不正な登録 (null)");
+        var names = excluded.Take(3).Select(e => e.Shortcut is { } shortcut ? shortcut.Describe() : "不正な登録 (null)");
         var remaining = excluded.Count > 3 ? $"、ほか {excluded.Count - 3} 件" : "";
         return $"{string.Join("、", names)}{remaining}\n詳細は「ログ / 判定理由」で確認できます。";
     }
@@ -412,30 +382,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (staged is { } shown) _updateItem.Text = $"Meltype {shown.Version} に更新して再起動";
     }
 
-    private bool _applyingUpdate;
-
-    private async void ApplyUpdate()
+    private void ApplyUpdate()
     {
-        // 新しい版の判定を待っている間に、メニューや通知からもう一度押されても始めない
-        if (_applyingUpdate) return;
-        _applyingUpdate = true;
-        try
-        {
-            // 更新の前に、あなたの打ち方で変わる語があれば見せる (issue #285)。
-            // 判定は新しい版の Meltype.exe を起動して待つので、UI スレッドの外で行う (待つ間も Meltype IME に応答するため)
-            if (Updater.Staged(Prerelease) is { } staged)
-            {
-                var words = _composition.Languages.Entries().Select(e => e.Word).Distinct().ToList();
-                var preview = await Task.Run(() => Updater.PreviewChanges(words, Prerelease));
-                if (!UpdateChangesDialog.Confirm(_composition.Languages, staged.Version, _engine.Settings, preview)) return;
-            }
-            // install.ps1 が Meltype を終了させてから入れ替え、新しい版を起動する。
-            if (!Updater.Apply(Prerelease)) MessageBox.Show("更新を始められませんでした。ログを確認してください。", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-        finally
-        {
-            _applyingUpdate = false;
-        }
+        // インストーラーが Meltype を終了させてから入れ替え、新しい版を起動する。
+        if (!Updater.Apply(Prerelease)) MessageBox.Show("更新を始められませんでした。ログを確認してください。", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     private async void CheckForUpdate()
@@ -469,6 +419,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
             {
                 _engine.OnSettingsChanged(previous, next);
                 UpdateStatus();
+                // 設定アプリで動作モードを Meltype IME にしたが、Windows に登録されていない (Meltype キーボードで動く)
+                if (previous.Mode != InputMode.Tsf && next.Mode == InputMode.Tsf && CanRegisterTsf && !Tip.TipServer.IsUsable)
+                    EnableTsf("Meltype IME を Windows に登録しますか？\n\n" +
+                        "Meltype IME は Windows の IME として、打った文字を入力欄に直接入れます。登録するまでは Meltype キーボード (変換ボックスで入力) で動きます。");
             });
         }
         catch (InvalidOperationException)
@@ -515,10 +469,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void ToggleAutoUpdate()
     {
-        var next = _engine.Settings.Clone();
-        next.AutoUpdate = !next.AutoUpdate;
-        _engine.ApplySettings(next);
-        _autoUpdateItem.Checked = next.AutoUpdate;
+        _engine.EditSettings(settings => settings.AutoUpdate = !settings.AutoUpdate);
+        _autoUpdateItem.Checked = _engine.Settings.AutoUpdate;
     }
 
     private void FillProfiles()
@@ -530,13 +482,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _profileItem.DropDownItems.Add(new ToolStripMenuItem(name, null, (_, _) => SwitchProfile(name)) { Checked = name == settings.ActiveProfile });
         }
         _profileItem.DropDownItems.Add(new ToolStripSeparator());
-        _profileItem.DropDownItems.Add("プロファイルを足す・名前を変える (設定)...", null, (_, _) => ShowSettings());
+        _profileItem.DropDownItems.Add("プロファイルを足す・名前を変える (設定)...", null, (_, _) => SettingsApp.Open());
     }
 
     private void SwitchProfile(string name)
     {
         if (name == _engine.Settings.ActiveProfile) return;
-        _engine.ApplySettings(_engine.Settings.SwitchProfile(name));
+        _engine.ReplaceSettings(settings => settings.SwitchProfile(name));
         UpdateStatus();
         if (ProfileSwitchMessage(_engine.Settings) is { } message) ShowBalloonTip(1500, "Meltype", message);
     }
@@ -548,9 +500,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void ToggleAutoDetection()
     {
-        var next = _engine.Settings.Clone();
-        next.AutoDetection = !next.AutoDetection;
-        _engine.ApplySettings(next);
+        _engine.EditSettings(settings => settings.AutoDetection = !settings.AutoDetection);
         UpdateStatus();
     }
 
@@ -558,10 +508,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         if (AppPaths.IsPortable && mode != InputMode.Keyboard) return;
         var wasTsf = _engine.Running.Mode == InputMode.Tsf;
-        var next = _engine.Settings.Clone();
-        next.Mode = mode;
-        next.Enabled = true;
-        _engine.ApplySettings(next);
+        _engine.EditSettings(settings =>
+        {
+            settings.Mode = mode;
+            settings.Enabled = true;
+        });
         // ほかのモードからなら MeltypeEngine.OnSettingsChanged が切り替える。もう Meltype IME のモードで選び直したとき (Win + Space でほかの IME にしていた) も、入力方式を Meltype IME に戻す
         if (wasTsf && mode == InputMode.Tsf) Tip.TipServer.ActivateForSession();
     }
@@ -575,10 +526,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _enabledItem.Checked = enabled;
         _keyboardModeItem.Checked = keyboard;
         _tsfModeItem.Checked = tsf;
-        // Meltype IME を使えない (ARM64 の Windows・登録されていない・キーボードの一覧に無い) なら選べない
-        // (選ぶとキーボードフックが止まり、どこでも何も起きなくなる)
+        // Meltype IME を使えず (登録されていない・キーボードの一覧に無い)、登録もできないなら選べない
+        // (使えないまま選ぶとキーボードフックが止まり、どこでも何も起きなくなる。登録できるなら、選んだときに登録する: SelectTsf)
         var registered = Tip.TipServer.IsRegistered;
-        _tsfModeItem.Enabled = tsf || Tip.TipServer.IsUsable;
+        _tsfModeItem.Enabled = tsf || Tip.TipServer.IsUsable || CanRegisterTsf;
         _autoDetectionItem.Checked = settings.AutoDetection;
         _profileItem.Text = $"プロファイル: {settings.ActiveProfile}";
 
@@ -591,7 +542,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         else if (tsf)
         {
             _tray.Icon = _onIcon;
-            status = registered ? "Meltype IME (Win + Space で Meltype を選んで入力)" : "Meltype IME が登録されていません (Install.cmd か Install-Meltype.ps1 で入れるか、別の動作モードを選んでください)";
+            status = registered ? "Meltype IME (Win + Space で Meltype を選んで入力)" : "Meltype IME が登録されていません (トレイの「Meltype IME」を選ぶと登録できます)";
         }
         else
         {
@@ -606,18 +557,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _tray.Text = tip.Length > 63 ? tip[..63] : tip;
     }
 
-    private void ShowSettings()
-    {
-        if (_settingsForm is { IsDisposed: false })
-        {
-            _settingsForm.Activate();
-            return;
-        }
-        _settingsForm = new SettingsForm(_engine, _state);
-        _settingsForm.FormClosed += (_, _) => UpdateStatus();
-        _settingsForm.Show();
-    }
-
     private void ShowKeyCount()
     {
         if (_keyCountForm is { IsDisposed: false })
@@ -629,41 +568,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _keyCountForm.Show();
     }
 
-    private void ShowLearnedWords()
-    {
-        if (_learnedForm is { IsDisposed: false })
-        {
-            _learnedForm.Activate();
-            return;
-        }
-        _learnedForm = new LearnedWordsForm(_composition.Languages, _composition.History);
-        _learnedForm.Show();
-    }
-
-    private void ShowUserDictionary()
-    {
-        if (_dictionaryForm is { IsDisposed: false })
-        {
-            _dictionaryForm.Activate();
-            return;
-        }
-        _dictionaryForm = new UserDictionaryForm(_composition);
-        _dictionaryForm.Show();
-    }
-
-    private void ShowSnippets()
-    {
-        if (_snippetsForm is { IsDisposed: false })
-        {
-            _snippetsForm.Activate();
-            return;
-        }
-        _snippetsForm = new SnippetsForm(_composition.Snippets, () => _engine.Settings.SnippetMark);
-        _snippetsForm.Show();
-    }
-
     /// <summary>
-    /// Ctrl+F7: 前面のアプリで選んでいる語を、ユーザー辞書の登録画面に入れて開く (読みは Microsoft IME で推測)。
+    /// Ctrl+F7: 前面のアプリで選んでいる語を、設定アプリのユーザー辞書の登録欄に入れて開く (読みは変換エンジンで推測)。
     /// 選んでいる語は、Ctrl+C を送ってクリップボードから読む (クリップボードの元の中身は戻す)。
     /// </summary>
     private async void RegisterSelectedWord()
@@ -686,9 +592,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             try { if (saved is not null) Clipboard.SetDataObject(saved, copy: true); } catch { }
         }
-        ShowUserDictionary();
         // 1 行で短いものだけ (文章を選んでいたら語は入れない)
-        if (word is { Length: > 0 and <= 30 } && !word.Contains('\n')) _dictionaryForm!.Prefill(word, _composition.GuessReading(word));
+        if (word is { Length: > 0 and <= 30 } && !word.Contains('\n')) SettingsApp.Open("--add-word", word, _composition.Runtime.GuessReading(word));
+        else SettingsApp.Open("--add-word");
     }
 
     private void ShowLog()
@@ -702,123 +608,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _logForm.Show();
     }
 
-    /// <summary>設定・学習データ・ユーザー辞書を 1 つのファイルに書き出す (PC の買い替え・別の PC への移行)。</summary>
-    private static void CreateBackup()
-    {
-        using var dialog = new SaveFileDialog
-        {
-            Title = "Meltype のバックアップを書き出す",
-            Filter = "Meltype のバックアップ (*.meltype-backup)|*.meltype-backup",
-            FileName = $"Meltype-{DateTime.Now:yyyyMMdd}.meltype-backup",
-        };
-        if (dialog.ShowDialog() != DialogResult.OK) return;
-        try
-        {
-            var (content, files) = Config.Backup.Create(AppPaths.DataDirectory, AppInfo.Version);
-            File.WriteAllBytes(dialog.FileName, content);
-            MessageBox.Show($"設定・学習データ・ユーザー辞書を書き出しました ({files} 個のファイル)。\n別の PC の Meltype で「バックアップ」→「バックアップから戻す...」を選ぶと戻せます。", "Meltype のバックアップ",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"書き出せませんでした。\n\n{ex.Message}", "Meltype のバックアップ", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-    }
-
-    /// <summary>バックアップから戻す。Meltype を起動し直し、新しい Meltype が戻してから読み込む。</summary>
-    private void RestoreBackup()
-    {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "Meltype のバックアップから戻す",
-            Filter = "Meltype のバックアップ (*.meltype-backup)|*.meltype-backup|すべてのファイル (*.*)|*.*",
-        };
-        if (dialog.ShowDialog() != DialogResult.OK) return;
-        try
-        {
-            var content = File.ReadAllBytes(dialog.FileName);
-            var (created, app, files) = Config.Backup.Inspect(content);
-            var answer = MessageBox.Show($"{created} に作ったバックアップ (Meltype {app}、{files.Count} 個のファイル) で、今の設定・学習データ・ユーザー辞書を置き換えます。\nMeltype を起動し直します。よろしいですか？",
-                "Meltype のバックアップ", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
-            if (answer != DialogResult.OK) return;
-            // 新しい Meltype に渡す (この Meltype が終わってから戻す)
-            var copy = Path.Combine(Path.GetTempPath(), $"meltype-restore-{Environment.ProcessId}.meltype-backup");
-            File.WriteAllBytes(copy, content);
-            var start = new ProcessStartInfo(Application.ExecutablePath) { UseShellExecute = false };
-            start.ArgumentList.Add("--restore");
-            start.ArgumentList.Add(copy);
-            Process.Start(start);
-            ExitThread();
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show($"戻せませんでした。\n\n{ex.Message}", "Meltype のバックアップ", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-    }
-
     private static void OpenDataFolder()
     {
         Directory.CreateDirectory(AppPaths.DataDirectory);
         Process.Start(new ProcessStartInfo("explorer.exe", $"\"{AppPaths.DataDirectory}\"") { UseShellExecute = true });
     }
 
-    private void ResetLearning()
+    /// <summary>インストーラーのアンインストーラーでアンインストールする (確認もアンインストーラーが出す)。</summary>
+    private static void Uninstall()
     {
-        var answer = MessageBox.Show("学習データ (選び直した変換 conversions.json、英字 / かなに直した語 languages.json、予測変換の語句 phrases.txt、選んだ英訳 translations.json) をすべて削除します。よろしいですか？\n\nユーザー辞書 (userdict.txt) と設定は消えません。", "Meltype", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
-        if (answer == DialogResult.OK) _composition.Runtime.ResetLearning();
-    }
-
-    /// <summary>最近覚えたものだけを忘れる (<see cref="Composition.MeltypeRuntime.ForgetLearningSince"/>)。</summary>
-    private void ForgetRecentLearning(DateTime sinceUtc, string label)
-    {
-        var answer = MessageBox.Show($"{label}に覚えた学習データ (選び直した変換・英字 / かなに直した語・予測変換の語句) を削除します。よろしいですか？", "Meltype", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
-        if (answer != DialogResult.OK) return;
-        var count = _composition.Runtime.ForgetLearningSince(sinceUtc);
-        Diagnostics.Log.Info($"{label}に覚えた学習データを削除しました ({count} 件)。");
-        MessageBox.Show(count > 0 ? $"{count} 件削除しました。" : "削除するものはありませんでした。", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Information);
-    }
-
-    /// <summary>
-    /// インストール先の uninstall.ps1 (install.ps1 がコピーしたもの) でアンインストールする。
-    /// zip の Uninstall.cmd を消してしまうと消す方法が無かった (テスターの報告)。
-    /// </summary>
-    private void Uninstall()
-    {
-        // インストーラー (Meltype-<版>-setup.exe) で入れたときは、そのアンインストーラーを使う (確認もアンインストーラーが出す)
-        var installer = Path.Combine(AppContext.BaseDirectory, "unins000.exe");
-        if (File.Exists(installer))
-        {
-            try
-            {
-                Process.Start(new ProcessStartInfo(installer) { UseShellExecute = true, WorkingDirectory = Path.GetTempPath() });
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"アンインストールを始められませんでした: {ex.Message}", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-            return;
-        }
-        var script = Path.Combine(AppContext.BaseDirectory, "uninstall.ps1");
-        if (!File.Exists(script))
-        {
-            MessageBox.Show("アンインストール用のファイルが見つかりません。Windows の「設定」→「アプリ」→「インストールされているアプリ」か、zip の中の Uninstall.cmd でアンインストールしてください。\nソースから Install-Meltype.ps1 で入れた場合は、ソースのフォルダーの Uninstall-Meltype.ps1 を実行してください (Meltype IME の登録も外します)。", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-        var answer = MessageBox.Show("Meltype をアンインストールします。設定・学習データ・ユーザー辞書も削除します。よろしいですか？\n(残したいときは、先に「バックアップ」→「バックアップを書き出す...」で書き出してください)", "Meltype のアンインストール", MessageBoxButtons.OKCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-        if (answer != DialogResult.OK) return;
         try
         {
-            // スクリプトが Meltype の終了を待ってからファイルを消す。インストール先を消せるように、作業フォルダーは別の場所にする。
-            var start = new ProcessStartInfo(Updater.PowerShell) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetTempPath() };
-            foreach (var arg in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", script, "-FromSettings" }) start.ArgumentList.Add(arg);
-            Process.Start(start);
+            Process.Start(new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "unins000.exe")) { UseShellExecute = true, WorkingDirectory = Path.GetTempPath() });
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"アンインストールを始められませんでした: {ex.Message}", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
+            MessageBox.Show($"アンインストールを始められませんでした: {ex.Message}\nWindows の「設定」→「アプリ」→「インストールされているアプリ」からアンインストールしてください。", "Meltype", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
-        ExitThread();
     }
 
     protected override void ExitThreadCore()
@@ -830,13 +636,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _tipServer.Dispose();
         _engine.Keyboard = null;
         _keyboard.Dispose();
-        Composition.LearningSaves.FlushAll();
+        Config.LearningSaves.FlushAll();
         _composition.Dispose();
-        _settingsForm?.Close();
         _logForm?.Close();
-        _dictionaryForm?.Close();
         _reportDialog?.Close();
-        _learnedForm?.Close();
         _welcomeForm?.Close();
         _updater.Dispose();
         _hotkey.Dispose();

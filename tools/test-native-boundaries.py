@@ -41,7 +41,7 @@ class NativeBoundaryTests(unittest.TestCase):
             encoding="utf-8",
         )
         cls.lib = ctypes.CDLL(str(cls.library_path))
-        cls.lib.meltype_init.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        cls.lib.meltype_init.argtypes = [ctypes.c_char_p]
         cls.lib.meltype_init.restype = ctypes.c_int
         cls.lib.meltype_ime_create.restype = ctypes.c_void_p
         cls.lib.meltype_ime_destroy.argtypes = [ctypes.c_void_p]
@@ -49,8 +49,8 @@ class NativeBoundaryTests(unittest.TestCase):
         cls.lib.meltype_ime_handle.restype = ctypes.c_void_p
         cls.lib.meltype_free.argtypes = [ctypes.c_void_p]
         cls.lib.meltype_shutdown.restype = None
-        # Mozc のヘルパーを置かないフォルダー (変換はかなのまま)。英単語の判定は同梱の一覧
-        assert cls.lib.meltype_init(cls.data.name.encode(), None) == 0
+        # Mozc のヘルパーを置かないフォルダー (変換はかなのまま)
+        assert cls.lib.meltype_init(cls.data.name.encode()) == 0
         # 終了するときの解放は、2 回呼ばれても 1 回だけ止める (一時フォルダーを消す前に)
         cls.addClassCleanup(cls.lib.meltype_shutdown)
         cls.addClassCleanup(cls.lib.meltype_shutdown)
@@ -174,14 +174,15 @@ class NativeBoundaryTests(unittest.TestCase):
 
     def test_normal_enter_keeps_english_spacing(self):
         self.type_text("ka", after="world")
-        result = self.key(0, vk=0x0D)
+        # キャレットの前後は出来事ごとにフロントが送ったものを使う (フロントはキーのたびに送る)
+        result = self.key(0, vk=0x0D, after="world")
         self.assertTrue(result["consumed"])
         self.assertEqual([self.commit("か ")], result["commits"])
 
     def test_name_context_keeps_unknown_name(self):
         for char in "taro":
             self.key(ord(char), before="my name is ")
-        self.assertEqual("taro", self.key(0, vk=0x0D)["commits"][0]["text"])
+        self.assertEqual("taro", self.key(0, vk=0x0D, before="my name is ")["commits"][0]["text"])
 
     def test_english_term_particle_tail(self):
         self.type_text("apinoerror")
